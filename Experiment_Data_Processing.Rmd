@@ -1,0 +1,1258 @@
+---
+title: "Experiment_Data_Processing"
+author: "Sirena Harrop"
+date: "2025-09-30"
+output: html_document
+---
+
+# Note from Author
+This is re-factored from the original Bias Diffusion R Code to achieve 2 goals.
+1) Make the code idempotent to allow for ease of re-running [[CURRENTLY INCOMPLETE]]
+2) Include all of the new variables needed in the new code.
+
+# Notes
+- Age ingroup is defined as +- 3 years.
+- Are people more ingroup with one identity over another?
+- Currently using treatment params for graph 1c
+
+
+# RMD Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+```{r loadLibraries}
+library(tidyverse)
+library(ggplot2)
+library(xgboost)
+library(caret)
+library(fastDummies)
+library(glmnet)
+```
+
+# Load Dataset
+```{r loadDataset}
+### LOAD DATASET ###
+setwd("/Users/sirena/Documents/gspp/term 3/Lab/Bias/")
+data <- read.csv("officialData.csv")
+set.seed(42)
+```
+
+# Tables for ingroup definition + model definition
+I have created these tables to make it easy to switch between models and ingroup definitions.
+```{r definitions}
+#Set up table#
+ingroupDefinition <- data.frame(
+  ID = 1:8,
+  Ingroup = c(
+    "ingroupAtLeastOne",
+    "ingroupAtLeastTwo",
+    "ingroupAtLeastThree",
+    "ingroupAgeOnly",
+    "ingroupGenderOnly",
+    "ingroupRaceOnly",
+    "ingroupPoliOnly",
+    "ingroupSESOnly"
+  )
+)
+
+modelDefinition <- data.frame(
+  ID = 1:2,
+  Model = c(
+    "LASSO",
+    "XGBoost"
+  )
+)
+
+## Select Model and Ingroup, refer to the tables for more def##
+ingroupChoice = 1  # Choose 1-8 from ingroupDefinition table
+model = 2  # 1 = LASSO, 2 = XGBoost
+
+# Store for later reference
+selectedIngroup <- ingroupDefinition$Ingroup[ingroupChoice]
+selectedModel <- modelDefinition$Model[model]
+
+# Print confirmation
+cat("Using ingroup:", selectedIngroup, "\n")
+cat("Using model:", selectedModel, "\n")
+```
+
+# Initial Pre-processing
+```{r preProcessing}
+### STEP 1.1 Remove header rows ###
+
+# Removing first two rows (Header and Sub header)
+dataNoHeader <- data[-c(1, 2), ]
+
+### STEP 1.2 Remove unnecessary rows and columns ###
+
+# Creating a new DF for tuples with duration longer than 30 seconds and that have completed the survey
+# and also removing those that fail attention checks!
+dataNoHeader$`Duration..in.seconds.` <- as.integer(dataNoHeader$`Duration..in.seconds.`)
+validData <- dataNoHeader %>% filter(Duration..in.seconds. > 30 & Finished == 1 &
+                                     ((T.AC1 == 12 & T.AC2 == 35 & T.AC3 == 0) | #Treatment 
+                                     (C.AC1 == 12 & C.AC2 == 35 & C.AC3 == 0))) #Control
+
+studyReason <- validData[c("R_STUDYGOAL")]
+
+# Keep the relevant columns as listed
+validData <- validData[c("ResponseId", 
+                         "TQ1", "TQ2", "TQ3", "TQ4", "TQ5", #Treatment
+                         "CQ1", "CQ2", "CQ3", "CQ4", "CQ5", #Control
+                         "R_Gender", "R_Age", "R_Race", "R_Political", "R_SES", #Respondent Characteristics
+                         "Age1", "Gender1", "Race1", "Poli1", "SES1", "MediCon1", "Severity1", #Q1
+                         "Age2", "Gender2", "Race2", "Poli2", "SES2", "MediCon2", "Severity2", #Q2
+                         "Age3", "Gender3", "Race3", "Poli3", "SES3", "MediCon3", "Severity3", #Q3
+                         "Age4", "Gender4", "Race4", "Poli4", "SES4", "MediCon4", "Severity4", #Q4
+                         "Age5", "Gender5", "Race5", "Poli5", "SES5", "MediCon5", "Severity5" #Q5
+                         )]
+
+### STEP 1.3 Create and retype relevant variables ###
+
+# creating treatment and control dummy variables
+validData$treatment <- ifelse(!is.na(validData$TQ1) & validData$TQ1 != "", 1, 0)
+validData$control <- ifelse(!is.na(validData$CQ1) & validData$CQ1 != "", 1, 0)
+
+# making sure type is numeric for the following columns
+validData <- validData %>%
+  mutate(across(c("R_Gender", "R_Age", "R_Political", "R_SES", "Age1", "Age2", "Age3", "Age4", "Age5"), as.numeric))
+
+validData <- validData %>%
+  mutate(
+    R_SESStandardized = ntile(R_SES, 3)
+  )
+
+### STEP 1.5 dummy cols for race ###
+validData <- validData %>%
+  mutate(
+    R_white   = if_else(str_detect(R_Race, "\\b1\\b"), 1, 0),
+    R_black   = if_else(str_detect(R_Race, "\\b2\\b"), 1, 0),
+    R_hispanic = if_else(str_detect(R_Race, "\\b6\\b"), 1, 0),
+    R_native  = if_else(str_detect(R_Race, "\\b3\\b"), 1, 0),
+    R_asian   = if_else(str_detect(R_Race, "\\b4\\b"), 1, 0),
+    R_pacific = if_else(str_detect(R_Race, "\\b5\\b"), 1, 0)
+  )
+
+```
+
+# Make Long and Add Ingroup
+```{r makeLongAddIngroup}
+### STEP 2.1 Make Long ###
+data_long <- validData %>%
+  pivot_longer(
+    cols = matches("^(TQ|CQ)\\d+"),
+    names_to = "question",
+    values_to = "response"
+  ) %>%
+  mutate(
+    question = str_remove(question, "^(TQ|CQ)")  # remove prefix
+  ) %>%
+  filter(response != "") %>%  # remove blank rows
+  filter(!is.na(as.numeric(as.character(response)))) # remove chars
+
+
+### STEP 2.2 ###
+data_long <- data_long %>% 
+  mutate(question = as.integer(question)) %>%
+  mutate(
+    ageScenario = case_when(
+      question == 1 ~ Age1,
+      question == 2 ~ Age2,
+      question == 3 ~ Age3,
+      question == 4 ~ Age4,
+      question == 5 ~ Age5
+    ),
+    genderScenario = case_when(
+      question == 1 ~ Gender1,
+      question == 2 ~ Gender2,
+      question == 3 ~ Gender3,
+      question == 4 ~ Gender4,
+      question == 5 ~ Gender5
+    ),
+    politicScenario = case_when(
+      question == 1 ~ Poli1,
+      question == 2 ~ Poli2,
+      question == 3 ~ Poli3,
+      question == 4 ~ Poli4,
+      question == 5 ~ Poli5
+    ),
+    raceScenario = case_when(
+      question == 1 ~ Race1,
+      question == 2 ~ Race2,
+      question == 3 ~ Race3,
+      question == 4 ~ Race4,
+      question == 5 ~ Race5
+    ),
+    SESScenario = case_when(
+      question == 1 ~ SES1,
+      question == 2 ~ SES2,
+      question == 3 ~ SES3,
+      question == 4 ~ SES4,
+      question == 5 ~ SES5
+    ),
+    MediConScenario = case_when(
+      question == 1 ~ MediCon1,
+      question == 2 ~ MediCon2,
+      question == 3 ~ MediCon3,
+      question == 4 ~ MediCon4,
+      question == 5 ~ MediCon5
+    ),
+    SeverityScenario = case_when(
+      question == 1 ~ Severity1,
+      question == 2 ~ Severity2,
+      question == 3 ~ Severity3,
+      question == 4 ~ Severity4,
+      question == 5 ~ Severity5
+    ),
+    ingroupRACE = case_when(
+      raceScenario == 1 ~ R_white,
+      raceScenario == 2 ~ R_black,
+      raceScenario == 3 ~ R_native,
+      raceScenario == 4 ~ R_asian,
+      raceScenario == 5 ~ R_pacific,
+      raceScenario == 6 ~ R_hispanic,
+      TRUE ~ 0
+    ) %>% replace_na(0),
+    ingroupAtLeastOne = if_else(
+      (R_Age >= ageScenario - 3 & R_Age <= ageScenario + 3) |
+      R_Gender == genderScenario |
+      ingroupRACE == 1 |
+      R_Political == politicScenario |
+      R_SESStandardized == SESScenario,
+      1, 0
+    ),
+    ingroupAtLeastTwo = if_else(
+      ((R_Age >= ageScenario - 3 & R_Age <= ageScenario + 3) + 
+      (R_Gender == genderScenario) + 
+      (ingroupRACE == 1) + 
+      (R_Political == politicScenario) + 
+      (R_SESStandardized == SESScenario)) >= 2,
+      1, 0
+    ),
+    ingroupAtLeastThree = if_else(
+      ((R_Age >= ageScenario - 3 & R_Age <= ageScenario + 3) + 
+      (R_Gender == genderScenario) + 
+      (ingroupRACE == 1) + 
+      (R_Political == politicScenario) + 
+      (R_SESStandardized == SESScenario)) >= 3,
+      1, 0
+    ),
+    ingroupRaceOnly = if_else(
+      ingroupRACE == 1,
+      1, 0
+    ),
+    ingroupAgeOnly = if_else(
+      (R_Age >= ageScenario - 3 & R_Age <= ageScenario + 3),
+      1, 0
+    ),
+    ingroupPoliOnly = if_else(
+      R_Political == politicScenario,
+      1, 0
+    ),
+    ingroupSESOnly = if_else(
+      R_SESStandardized == SESScenario,
+      1, 0
+    ),
+    ingroupGenderOnly = if_else(
+      R_Gender == genderScenario,
+      1, 0
+    ))
+
+```
+
+# Respondent Stats
+```{r respondentStats}
+respondentsStats  <- validData %>%
+  summarise(
+    Total_N = n(),
+    N_Treatment = sum(control == 0),
+    N_Control = sum(control == 1),
+    
+    # Age statistics
+    Mean_Age = mean(R_Age, na.rm = TRUE),
+    Median_Age = median(R_Age, na.rm = TRUE),
+    Mode_Age = as.numeric(names(sort(table(R_Age), decreasing = TRUE)[1])),
+    Min_Age = min(R_Age, na.rm = TRUE),
+    Max_Age = max(R_Age, na.rm = TRUE),
+    
+    # Race counts
+    N_White = sum(R_white == 1, na.rm = TRUE),
+    N_Black = sum(R_black == 1, na.rm = TRUE),
+    N_Hispanic = sum(R_hispanic == 1, na.rm = TRUE),
+    N_Asian = sum(R_asian == 1, na.rm = TRUE),
+    N_Native = sum(R_native == 1, na.rm = TRUE),
+    N_Pacific = sum(R_pacific == 1, na.rm = TRUE),
+    
+    # Gender counts
+    N_male = sum(R_Gender == 1, na.rm = TRUE),
+    N_female = sum(R_Gender == 2, na.rm = TRUE),
+    N_nonbinary = sum(R_Gender == 3, na.rm = TRUE),
+    N_Gender_NA = sum(R_Gender == -2, na.rm = TRUE),
+    
+    # Political counts
+    N_dem = sum(R_Political == 1, na.rm = TRUE),
+    N_rep = sum(R_Political == 2, na.rm = TRUE),
+    N_ind = sum(R_Political == 3, na.rm = TRUE),
+    N_Political_NA = sum(R_Political == -2, na.rm = TRUE)
+  )
+
+glimpse(respondentsStats)
+
+```
+
+# InGroup Stats
+```{r inGroupStats}
+ingroupStats <- data_long %>%
+  summarise(
+    N_ingroupAtLeastOne = sum(ingroupAtLeastOne == 1, na.rm = TRUE),
+    N_ingroupAtLeastTwo = sum(ingroupAtLeastTwo == 1, na.rm = TRUE),
+    N_ingroupAtLeastThree = sum(ingroupAtLeastThree == 1, na.rm = TRUE),
+    N_ingroupRaceOnly = sum(ingroupRaceOnly == 1, na.rm = TRUE),
+    N_ingroupAgeOnly = sum(ingroupAgeOnly == 1, na.rm = TRUE),
+    N_ingroupPoliOnly = sum(ingroupPoliOnly == 1, na.rm = TRUE),
+    N_ingroupSESOnly = sum(ingroupSESOnly == 1, na.rm = TRUE),
+    N_ingroupGenderOnly = sum(ingroupGenderOnly == 1, na.rm = TRUE)
+  )
+
+glimpse(ingroupStats)
+
+```
+# Set variables and prepare final datasteps for 3 graphs
+```{r setVariables}
+### STEP 3.1 Set which ingroup definition ###
+
+# Automatically set ingroup based on choice
+ingroupColumn <- ingroupDefinition$Ingroup[ingroupChoice]
+data_long$ingroup <- data_long[[ingroupColumn]]
+
+
+### STEP 3.2 finalize dataset for future 3 graphs ###
+## Remove Age Gender Race Poli SES Medicon Severity Columns ###
+data_longer <- data_long %>% select(ResponseId, response, ingroup, treatment, control, ageScenario, genderScenario, raceScenario, politicScenario, SESScenario, SeverityScenario, MediConScenario, R_Age, R_Gender, R_Political, R_SESStandardized, R_white, R_black, R_hispanic, R_asian, R_pacific, R_native)
+```
+
+# Regression pre-model
+```{r}
+firstRegression <- lm(response ~ ageScenario + factor(genderScenario) + factor(raceScenario) + 
+            factor(SESScenario) + factor(SeverityScenario) + factor(MediConScenario), 
+            data = data_long)
+
+#summary(firstRegression)
+
+data_onlyTreatment <- data_long %>% filter(treatment == 1 & R_Race == 1)
+
+onlyTreatmentRegression <- lm(response ~ ageScenario + factor(genderScenario) + factor(raceScenario) + 
+            factor(SESScenario) + factor(SeverityScenario) + factor(MediConScenario), 
+            data = data_onlyTreatment)
+
+summary(onlyTreatmentRegression)
+
+```
+
+#respondent race
+```{r}
+table(data_onlyTreatment$R_Race)
+
+```
+
+
+# Create Graph 1A
+```{r}
+
+### STEP 4.1 ###
+Graph1A_df <- data_longer %>% 
+  group_by(control, ingroup) %>%
+  summarise(
+    avg_minutes = mean(as.numeric(response)),
+    sd = sd(as.numeric(response)),
+    n = n()
+  ) %>%
+  ungroup()
+
+
+### STEP 4.2 Create Error Bars ###
+
+
+Graph1A_df$se = Graph1A_df$sd / sqrt(Graph1A_df$n)
+Graph1A_df$ci = Graph1A_df$se * 1.96
+Graph1A_df$lower = Graph1A_df$avg_minutes - Graph1A_df$ci
+Graph1A_df$upper = Graph1A_df$avg_minutes + Graph1A_df$ci
+
+# Reorder rows
+Graph1A_df <- Graph1A_df %>%
+  mutate(group = if_else(ingroup == 1, "ingroup", "outgroup")) %>%
+  mutate(group = factor(group, levels = c("outgroup", "ingroup"))) %>%
+  mutate(condition = if_else(control == 1, "control", "treatment"))
+
+
+### STEP 4.3 Create Plot ###
+
+ggplot(Graph1A_df, aes(x = condition, y = avg_minutes, fill = group)) +
+  geom_bar(stat = "identity", color = "black", position = "dodge", width = 0.6,) +  # Black edge color
+  scale_fill_manual(values = c("darkred", "#3c3d66")) +  # Custom colors
+  # scale_y_continuous(breaks = seq(0, 0.25, 0.05), limits = c(0, 0.205)) +  # Y-axis ticks
+  geom_errorbar(aes(ymin=lower, ymax=upper), linewidth = 0.67, width=.15,
+                position=position_dodge(.6)) +
+  labs(y = "Average Minutes Given", x = "", 
+     title = paste("In-Group vs. Out-Group Selection by Condition -", selectedIngroup)) +
+  theme_minimal() +  # Clean theme
+  theme(legend.position = "bottom", panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+
+```
+
+# Preprocess for Graph2B
+```{r}
+
+### STEP 4.1 Identify Feature Vars ###
+
+feature_vars <- c("ResponseId", "response", "treatment", "control", "ingroup")
+
+
+### STEP 4.2 Create DF with dummies for Graph1B ###
+
+Graph1B_df <- data_longer
+Graph1B_df <- dummy_cols(Graph1B_df, select_columns = c(
+    "genderScenario", 
+    "politicScenario",
+    "raceScenario",
+    "SESScenario", 
+    "MediConScenario", 
+    "SeverityScenario",
+    "R_Gender", 
+    "R_Political",
+    "R_SESStandardized"
+  ), remove_selected_columns = TRUE,
+  remove_first_dummy = FALSE)
+
+### STEP 4.3 Create TRAINING and TEST DATA ###
+
+# Treatment
+selected_users_treatment <- Graph1B_df %>%
+  filter(control == 0) %>%
+  distinct(ResponseId) %>%
+  sample_frac(0.7)
+
+# Filter the original dataset to include only the selected users
+treatment_train <- Graph1B_df %>%
+  filter(control == 0, ResponseId %in% selected_users_treatment$ResponseId)
+treatment_test <- Graph1B_df %>%
+  filter(control == 0, !(ResponseId %in% selected_users_treatment$ResponseId))
+
+# Clean Up
+treatment_train$response <- as.numeric(treatment_train$response)
+treatment_train <- treatment_train %>% select(-ingroup)
+
+# Control
+selected_users_control <- Graph1B_df %>%
+  filter(control == 1) %>%
+  distinct(ResponseId) %>%
+  sample_frac(0.7)
+
+# Filter the original dataset to include only the selected users
+control_train <- Graph1B_df %>%
+  filter(control == 1, ResponseId %in% selected_users_control$ResponseId)
+control_test <- Graph1B_df %>%
+  filter(control == 1, !(ResponseId %in% selected_users_control$ResponseId))
+
+# Clean Up
+control_train$response <- as.numeric(control_train$response)
+control_train <- control_train %>% select(-ingroup)
+
+# Combine test sets to create the hold-out set
+holdout_set <- bind_rows(treatment_test, control_test)
+
+control_size = nrow(selected_users_control)
+treatment_size = nrow(selected_users_treatment)
+
+### STEP 4.4 Convert to Matrices for Training ###
+
+inputFeatures <- setdiff(colnames(Graph1B_df), c(feature_vars))
+
+treatment_train_matrix <- as.matrix(treatment_train[, inputFeatures])
+control_train_matrix <- as.matrix(control_train[, inputFeatures])
+holdout_matrix <- as.matrix(holdout_set[, inputFeatures])
+```
+
+```{r}
+#==============================================================================
+# FUNCTION 1: TUNE HYPERPARAMETERS
+#==============================================================================
+tune_hyperparameters <- function(model_type, 
+                                  treatment_train, 
+                                  control_train,
+                                  treatment_train_matrix,
+                                  control_train_matrix) {
+  
+  if (model_type == 1) {
+    # ============ LASSO ============
+    cat("Tuning LASSO hyperparameters...\n")
+    
+    # Tune treatment model
+    cat("  Tuning treatment...\n")
+    lasso_treatment <- cv.glmnet(
+      x = treatment_train_matrix,
+      y = treatment_train$response,
+      alpha = 1,
+      nfolds = 5,
+      type.measure = "mse"
+    )
+    treatment_lambda <- lasso_treatment$lambda.min
+    
+    # Tune control model
+    cat("  Tuning control...\n")
+    lasso_control <- cv.glmnet(
+      x = control_train_matrix,
+      y = control_train$response,
+      alpha = 1,
+      nfolds = 5,
+      type.measure = "mse"
+    )
+    control_lambda <- lasso_control$lambda.min
+    
+    cat("Treatment lambda:", treatment_lambda, "\n")
+    cat("Control lambda:", control_lambda, "\n")
+    
+    return(list(
+      treatment_params = list(lambda = treatment_lambda),
+      control_params = list(lambda = control_lambda)
+    ))
+    
+  } else if (model_type == 2) {
+    # ============ XGBoost ============
+    cat("Tuning XGBoost hyperparameters...\n")
+    
+    ctrl <- trainControl(method = "cv", number = 5, verboseIter = TRUE)
+    
+    xgb_grid <- expand.grid(
+      nrounds = c(200, 500, 1000),
+      colsample_bytree = c(0.3, 0.5, 0.7, 0.8, 1.0),
+      eta = 0.3,
+      max_depth = 6,
+      gamma = 0,
+      min_child_weight = 1,
+      subsample = 1
+    )
+    
+    # Tune treatment
+    cat("  Tuning treatment...\n")
+    xgb_model_treatment <- train(
+      x = treatment_train_matrix,
+      y = treatment_train$response,
+      method = "xgbTree",
+      trControl = ctrl,
+      tuneGrid = xgb_grid,
+      metric = "RMSE"
+    )
+    
+    # Tune control
+    cat("  Tuning control...\n")
+    xgb_model_control <- train(
+      x = control_train_matrix,
+      y = control_train$response,
+      method = "xgbTree",
+      trControl = ctrl,
+      tuneGrid = xgb_grid,
+      metric = "RMSE"
+    )
+    
+    print(xgb_model_treatment$bestTune)
+    print(xgb_model_control$bestTune)
+    
+    return(list(
+      treatment_params = list(
+        objective = "reg:squarederror",
+        eval_metric = "logloss",
+        max_depth = xgb_model_treatment$bestTune[["max_depth"]],
+        eta = xgb_model_treatment$bestTune[["eta"]],
+        nrounds = xgb_model_treatment$bestTune[["nrounds"]],
+        colsample_bytree = xgb_model_treatment$bestTune[["colsample_bytree"]]
+      ),
+      control_params = list(
+        objective = "reg:squarederror",
+        eval_metric = "logloss",
+        max_depth = xgb_model_control$bestTune[["max_depth"]],
+        eta = xgb_model_control$bestTune[["eta"]],
+        nrounds = xgb_model_control$bestTune[["nrounds"]],
+        colsample_bytree = xgb_model_control$bestTune[["colsample_bytree"]]
+      )
+    ))
+  }
+}
+
+#==============================================================================
+# FUNCTION 2: TRAIN MODELS WITH HYPERPARAMETERS
+#==============================================================================
+train_models <- function(model_type,
+                         treatment_train,
+                         control_train,
+                         treatment_train_matrix,
+                         control_train_matrix,
+                         treatment_params,
+                         control_params) {
+  
+  if (model_type == 1) {
+    # ============ LASSO ============
+    cat("Training LASSO models...\n")
+    
+    # Train treatment
+    treatment_model <- glmnet(
+      x = treatment_train_matrix,
+      y = treatment_train$response,
+      alpha = 1,
+      lambda = treatment_params$lambda
+    )
+    
+    # Train control
+    control_model <- glmnet(
+      x = control_train_matrix,
+      y = control_train$response,
+      alpha = 1,
+      lambda = control_params$lambda
+    )
+    
+    return(list(
+      treatment_model = treatment_model,
+      control_model = control_model
+    ))
+    
+  } else if (model_type == 2) {
+    # ============ XGBoost ============
+    cat("Training XGBoost models...\n")
+    
+    # Create DMatrix
+    dtrain_treatment <- xgb.DMatrix(data = treatment_train_matrix, 
+                                     label = treatment_train$response)
+    dtrain_control <- xgb.DMatrix(data = control_train_matrix, 
+                                   label = control_train$response)
+    
+    # Extract nrounds
+    treatment_nrounds <- treatment_params$nrounds
+    control_nrounds <- control_params$nrounds
+    
+    # Remove nrounds from params (it's a separate argument)
+    treatment_xgb_params <- treatment_params[names(treatment_params) != "nrounds"]
+    control_xgb_params <- control_params[names(control_params) != "nrounds"]
+    
+    # Train
+    treatment_model <- xgboost(
+      data = dtrain_treatment,
+      params = treatment_xgb_params,
+      nrounds = treatment_nrounds,
+      verbose = 0
+    )
+    
+    control_model <- xgboost(
+      data = dtrain_control,
+      params = control_xgb_params,
+      nrounds = control_nrounds,
+      verbose = 0
+    )
+    
+    return(list(
+      treatment_model = treatment_model,
+      control_model = control_model
+    ))
+  }
+}
+
+#==============================================================================
+# FUNCTION 3: MAKE PREDICTIONS
+#==============================================================================
+predict_models <- function(model_type, 
+                           treatment_model, 
+                           control_model, 
+                           holdout_matrix,
+                           treatment_params = NULL,
+                           control_params = NULL) {
+  
+  if (model_type == 1) {
+    # ============ LASSO ============
+    pred_treatment <- predict(treatment_model, newx = holdout_matrix, 
+                              s = treatment_params$lambda)
+    pred_control <- predict(control_model, newx = holdout_matrix, 
+                            s = control_params$lambda)
+    
+    return(list(
+      pred_treatment = as.vector(pred_treatment),
+      pred_control = as.vector(pred_control)
+    ))
+    
+  } else if (model_type == 2) {
+    # ============ XGBoost ============
+    dtest <- xgb.DMatrix(data = holdout_matrix)
+    
+    pred_treatment <- predict(treatment_model, dtest)
+    pred_control <- predict(control_model, dtest)
+    
+    return(list(
+      pred_treatment = pred_treatment,
+      pred_control = pred_control
+    ))
+  }
+}
+
+#==============================================================================
+# FUNCTION 4: TRAIN SINGLE MODEL (for bootstrap)
+#==============================================================================
+train_single_model <- function(model_type, 
+                                train_data, 
+                                input_features,
+                                params) {
+  
+  train_matrix <- as.matrix(train_data[, input_features])
+  
+  if (model_type == 1) {
+    # ============ LASSO ============
+    model <- glmnet(
+      x = train_matrix,
+      y = train_data$response,
+      alpha = 1,
+      lambda = params$lambda
+    )
+    
+  } else if (model_type == 2) {
+    # ============ XGBoost ============
+    dtrain <- xgb.DMatrix(data = train_matrix, label = train_data$response)
+    
+    # Extract nrounds
+    nrounds <- params$nrounds
+    xgb_params <- params[names(params) != "nrounds"]
+    
+    model <- xgboost(
+      data = dtrain,
+      params = xgb_params,
+      nrounds = nrounds,
+      verbose = 0
+    )
+  }
+  
+  return(model)
+}
+
+#==============================================================================
+# FUNCTION 5: BOOTSTRAP HELPER (refactored to work with both models)
+#==============================================================================
+get_delta_for_fraction <- function(frac_treatment, 
+                                   sizeOfDataset, 
+                                   treatment_train, 
+                                   control_train,
+                                   holdout_set,
+                                   holdout_matrix,
+                                   input_features,
+                                   model_type,
+                                   params) {
+  
+  # Sample users
+  num_treatment_sample <- round(frac_treatment * sizeOfDataset)
+  num_control_sample <- round((1 - frac_treatment) * sizeOfDataset)
+  
+  selected_users_treatment <- treatment_train %>%
+    distinct(ResponseId) %>%
+    sample_n(num_treatment_sample, replace = TRUE)
+  
+  selected_users_control <- control_train %>%
+    distinct(ResponseId) %>%
+    sample_n(num_control_sample, replace = TRUE)
+  
+  # Subset rows
+  curr_treatment_train <- treatment_train %>%
+    filter(ResponseId %in% selected_users_treatment$ResponseId)
+  
+  curr_control_train <- control_train %>%
+    filter(ResponseId %in% selected_users_control$ResponseId)
+  
+  # Combine
+  if (nrow(curr_treatment_train) == 0) {
+    curr_train <- curr_control_train
+  } else if (nrow(curr_control_train) == 0) {
+    curr_train <- curr_treatment_train
+  } else {
+    curr_train <- bind_rows(curr_treatment_train, curr_control_train)
+  }
+  
+  # Train model
+  model <- train_single_model(model_type, curr_train, input_features, params)
+  
+  # Predict
+  if (model_type == 1) {
+    pred <- predict(model, newx = holdout_matrix, s = params$lambda)
+    pred <- as.vector(pred)
+  } else {
+    dtest <- xgb.DMatrix(data = holdout_matrix)
+    pred <- predict(model, dtest)
+  }
+  
+  # Calculate delta
+  holdout_results <- holdout_set %>%
+    mutate(pred_curr = pmin(pmax(pred, 0), 60))
+  
+  avg_rank <- mean(holdout_results$pred_curr)
+  
+  holdout_results <- holdout_results %>%
+    mutate(avgSlotsCurr = pred_curr - avg_rank)
+  
+  final_results <- holdout_results %>%
+    group_by(ingroup) %>%
+    summarize(avg_pos_curr = mean(avgSlotsCurr), .groups = "drop")
+  
+  avg_ingroup <- final_results %>% filter(ingroup == 1) %>% pull(avg_pos_curr)
+  avg_outgroup <- final_results %>% filter(ingroup == 0) %>% pull(avg_pos_curr)
+  
+  return(avg_ingroup - avg_outgroup)
+}
+```
+
+
+```{r}
+#==============================================================================
+# Graph 1B
+#==============================================================================
+
+# Step 1: Tune hyperparameters
+hyperparams <- tune_hyperparameters(
+  model_type = model,
+  treatment_train = treatment_train,
+  control_train = control_train,
+  treatment_train_matrix = treatment_train_matrix,
+  control_train_matrix = control_train_matrix
+)
+
+# Step 2: Train models
+trained_models <- train_models(
+  model_type = model,
+  treatment_train = treatment_train,
+  control_train = control_train,
+  treatment_train_matrix = treatment_train_matrix,
+  control_train_matrix = control_train_matrix,
+  treatment_params = hyperparams$treatment_params,
+  control_params = hyperparams$control_params
+)
+
+# Step 3: Make predictions for Graph 1
+predictions <- predict_models(
+  model_type = model,
+  treatment_model = trained_models$treatment_model,
+  control_model = trained_models$control_model,
+  holdout_matrix = holdout_matrix,
+  treatment_params = hyperparams$treatment_params,
+  control_params = hyperparams$control_params
+)
+
+pred_treatment <- predictions$pred_treatment
+pred_control <- predictions$pred_control
+
+```
+
+# Model Evaluation Metrics
+```{r modelEvaluation}
+#==============================================================================
+# FUNCTION: Calculate Regression Metrics
+#==============================================================================
+calculate_metrics <- function(actual, predicted, model_name = "") {
+  # Remove NAs
+  complete_cases <- complete.cases(actual, predicted)
+  actual <- actual[complete_cases]
+  predicted <- predicted[complete_cases]
+
+  # Calculate metrics
+  residuals <- actual - predicted
+
+  mse <- mean(residuals^2)
+  rmse <- sqrt(mse)
+  mae <- mean(abs(residuals))
+
+  # R-squared
+  ss_res <- sum(residuals^2)
+  ss_tot <- sum((actual - mean(actual))^2)
+  r_squared <- 1 - (ss_res / ss_tot)
+
+  # Adjusted R-squared (assuming you have p predictors)
+  n <- length(actual)
+
+  # Mean Absolute Percentage Error (MAPE)
+  # Only calculate if no zeros in actual
+  if (all(actual != 0)) {
+    mape <- mean(abs(residuals / actual)) * 100
+  } else {
+    mape <- NA
+  }
+
+  # Return as data frame
+  data.frame(
+    Model = model_name,
+    N = n,
+    RMSE = round(rmse, 3),
+    MAE = round(mae, 3),
+    MSE = round(mse, 3),
+    R_squared = round(r_squared, 4),
+    MAPE = round(mape, 2)
+  )
+}
+
+#==============================================================================
+# Evaluate on Training Data
+#==============================================================================
+cat("=== TRAINING SET PERFORMANCE ===\n\n")
+
+# Get predictions on training data
+train_pred_treatment <- predict_models(
+  model_type = model,
+  treatment_model = trained_models$treatment_model,
+  control_model = trained_models$control_model,
+  holdout_matrix = treatment_train_matrix,
+  treatment_params = hyperparams$treatment_params,
+  control_params = hyperparams$control_params
+)
+
+train_pred_control <- predict_models(
+  model_type = model,
+  treatment_model = trained_models$treatment_model,
+  control_model = trained_models$control_model,
+  holdout_matrix = control_train_matrix,
+  treatment_params = hyperparams$treatment_params,
+  control_params = hyperparams$control_params
+)
+
+# Calculate metrics for training set
+train_metrics_treatment <- calculate_metrics(
+  actual = treatment_train$response,
+  predicted = train_pred_treatment$pred_treatment,
+  model_name = "Treatment (Train)"
+)
+
+train_metrics_control <- calculate_metrics(
+  actual = control_train$response,
+  predicted = train_pred_control$pred_control,
+  model_name = "Control (Train)"
+)
+
+training_metrics <- bind_rows(train_metrics_treatment, train_metrics_control)
+print(training_metrics)
+
+#==============================================================================
+# Evaluate on Holdout/Test Data
+#==============================================================================
+cat("\n=== HOLDOUT/TEST SET PERFORMANCE ===\n\n")
+
+# Separate holdout by treatment/control
+holdout_treatment <- holdout_set %>% filter(treatment == 1)
+holdout_control <- holdout_set %>% filter(control == 1)
+
+# Get indices for subsetting predictions
+treatment_indices <- which(holdout_set$treatment == 1)
+control_indices <- which(holdout_set$control == 1)
+
+# Calculate metrics for holdout set
+test_metrics_treatment <- calculate_metrics(
+  actual = as.numeric(holdout_treatment$response),
+  predicted = pred_treatment[treatment_indices],
+  model_name = "Treatment (Test)"
+)
+
+test_metrics_control <- calculate_metrics(
+  actual = as.numeric(holdout_control$response),
+  predicted = pred_control[control_indices],
+  model_name = "Control (Test)"
+)
+
+test_metrics <- bind_rows(test_metrics_treatment, test_metrics_control)
+print(test_metrics)
+
+#==============================================================================
+# Combined Metrics Table
+#==============================================================================
+cat("\n=== COMBINED METRICS (Train vs Test) ===\n\n")
+all_metrics <- bind_rows(training_metrics, test_metrics)
+print(all_metrics)
+
+# Check for overfitting
+cat("\n=== OVERFITTING CHECK ===\n")
+cat("Treatment - Train R²:", train_metrics_treatment$R_squared,
+    "| Test R²:", test_metrics_treatment$R_squared,
+    "| Difference:", round(train_metrics_treatment$R_squared - test_metrics_treatment$R_squared, 4), "\n")
+cat("Control - Train R²:", train_metrics_control$R_squared,
+    "| Test R²:", test_metrics_control$R_squared,
+    "| Difference:", round(train_metrics_control$R_squared - test_metrics_control$R_squared, 4), "\n")
+
+if (abs(train_metrics_treatment$R_squared - test_metrics_treatment$R_squared) > 0.1 ||
+    abs(train_metrics_control$R_squared - test_metrics_control$R_squared) > 0.1) {
+  cat("\n⚠️  WARNING: Large gap between train and test R² suggests potential overfitting\n")
+}
+
+#==============================================================================
+# Residual Analysis
+#==============================================================================
+cat("\n=== RESIDUAL ANALYSIS ===\n\n")
+
+# Treatment residuals
+treatment_residuals <- as.numeric(holdout_treatment$response) - pred_treatment[treatment_indices]
+control_residuals <- as.numeric(holdout_control$response) - pred_control[control_indices]
+
+residual_stats <- data.frame(
+  Model = c("Treatment", "Control"),
+  Mean_Residual = c(mean(treatment_residuals), mean(control_residuals)),
+  Median_Residual = c(median(treatment_residuals), median(control_residuals)),
+  SD_Residual = c(sd(treatment_residuals), sd(control_residuals)),
+  Min_Residual = c(min(treatment_residuals), min(control_residuals)),
+  Max_Residual = c(max(treatment_residuals), max(control_residuals))
+)
+
+# Round only numeric columns
+residual_stats_rounded <- residual_stats %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+print(residual_stats_rounded)
+
+#==============================================================================
+# Residual Plots
+#==============================================================================
+
+# Create residual data frames
+residual_df_treatment <- data.frame(
+  predicted = pred_treatment[treatment_indices],
+  residual = treatment_residuals,
+  model = "Treatment"
+)
+
+residual_df_control <- data.frame(
+  predicted = pred_control[control_indices],
+  residual = control_residuals,
+  model = "Control"
+)
+
+residual_df <- bind_rows(residual_df_treatment, residual_df_control)
+
+# Residuals vs Fitted
+ggplot(residual_df, aes(x = predicted, y = residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = TRUE, color = "blue") +
+  facet_wrap(~model) +
+  labs(
+    title = "Residuals vs Fitted Values",
+    x = "Fitted Values (Predicted Minutes)",
+    y = "Residuals"
+  ) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+
+# QQ Plot for residuals
+ggplot(residual_df, aes(sample = residual)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  facet_wrap(~model) +
+  labs(
+    title = "Q-Q Plot of Residuals",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+
+# Histogram of residuals
+ggplot(residual_df, aes(x = residual)) +
+  geom_histogram(bins = 30, fill = "#3c3d66", color = "black", alpha = 0.7) +
+  facet_wrap(~model) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Distribution of Residuals",
+    x = "Residuals",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+
+```
+
+```{r}
+#==============================================================================
+# Feature Importance (XGBoost only)
+#==============================================================================
+
+if (model == 2) {  # XGBoost
+  cat("\n=== FEATURE IMPORTANCE (XGBoost) ===\n\n")
+
+  # Get importance for treatment model
+  importance_treatment <- xgb.importance(
+    feature_names = inputFeatures,
+    model = trained_models$treatment_model
+  )
+
+  # Get importance for control model
+  importance_control <- xgb.importance(
+    feature_names = inputFeatures,
+    model = trained_models$control_model
+  )
+
+  cat("Top 15 Features - Treatment Model:\n")
+  print(head(importance_treatment, 15))
+
+  cat("\nTop 15 Features - Control Model:\n")
+  print(head(importance_control, 15))
+
+  # Plot importance for treatment
+  xgb.plot.importance(
+    importance_matrix = head(importance_treatment, 20),
+    main = "Feature Importance - Treatment Model (Top 20)"
+  )
+
+  # Plot importance for control
+  xgb.plot.importance(
+    importance_matrix = head(importance_control, 20),
+    main = "Feature Importance - Control Model (Top 20)"
+  )
+}
+
+```
+
+```{r}
+# Step 4: Create Graph 1 data (your existing code)
+holdout_results <- holdout_set %>%
+  mutate(yhatTreat = pmin(pmax(pred_treatment, 0), 60),
+         yhatControl = pmin(pmax(pred_control, 0), 60))
+
+avg_rank <- holdout_results %>% 
+  summarize(
+    avg_treatment = mean(yhatTreat),
+    avg_control = mean(yhatControl)
+  )
+
+holdout_results <- holdout_results %>%
+    mutate(avgSlotstreatment = yhatTreat - avg_rank$avg_treatment,
+         avgSlotscontrol = yhatControl - avg_rank$avg_control)
+
+final_results <- holdout_results %>% 
+  group_by(ingroup) %>% 
+  summarize(
+    avg_pos_control = mean(avgSlotscontrol),
+    SE_control = sd(avgSlotscontrol) / sqrt(nrow(holdout_results)),
+    avg_pos_treatment = mean(avgSlotstreatment),
+    SE_treatment = sd(avgSlotstreatment) / sqrt(nrow(holdout_results))
+  ) %>%
+  mutate(
+    upper_control = avg_pos_control + 1.96 * SE_control,
+    lower_control = avg_pos_control - 1.96 * SE_control,
+    upper_treatment = avg_pos_treatment + 1.96 * SE_treatment,
+    lower_treatment = avg_pos_treatment - 1.96 * SE_treatment
+  )
+
+control_long <- final_results %>%
+  select(ingroup, avg = avg_pos_control,
+         upper = upper_control,
+         lower = lower_control) %>%
+  mutate(condition = "control")
+
+treatment_long <- final_results %>%
+  select(ingroup, avg = avg_pos_treatment,
+         upper = upper_treatment,
+         lower = lower_treatment) %>%
+  mutate(condition = "treatment")
+
+final_results_long <- bind_rows(control_long, treatment_long)
+
+# GRAPH 1
+final_results_long$group_label <- factor(
+  final_results_long$ingroup,
+  levels = c(0, 1),
+  labels = c("Outgroup", "Ingroup")
+)
+
+ggplot(final_results_long, aes(x = condition, y = avg, color = group_label, shape = group_label)) +
+  geom_point(size = 4) + 
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  theme_minimal() +
+  scale_color_manual(values = c("Outgroup" = "darkred", "Ingroup" = "#3c3d66")) +
+  scale_shape_manual(values = c("Outgroup" = 15, "Ingroup" = 16)) +
+  labs(color = "Group", shape = "Group") +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    linewidth = 0.6,
+    width = 0.05
+  ) +
+  scale_x_discrete(labels = c(control = "Control", treatment = "Treatment")) +
+  scale_y_continuous() +
+  labs(
+    x = "Mindset of users in training data",
+    y = "Average number of minutes above overall mean time given",
+    title = paste("Model:", selectedModel, "| Ingroup:", selectedIngroup)
+  ) +
+  theme(axis.text.x = element_text(hjust = .5), 
+        legend.position = "bottom", 
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+```
+
+
+```{r}
+
+#==============================================================================
+# GRAPH 1C: Bootstrap fraction analysis
+#==============================================================================
+
+# Use treatment params for the bootstrap (or average them, or let user choose)
+bootstrap_params <- hyperparams$treatment_params
+
+fractions <- c(0, 0.2, 0.4, 0.6, 0.8, 1.0)
+R <- 100
+sizeOfDataset <- min(control_size, treatment_size)
+
+results_list <- list()
+
+for (f in fractions) {
+  cat("Processing fraction =", f, "\n")
+  
+  delta_values <- replicate(
+    R,
+    get_delta_for_fraction(
+      frac_treatment = f,
+      sizeOfDataset = sizeOfDataset,
+      treatment_train = treatment_train,
+      control_train = control_train,
+      holdout_set = holdout_set,
+      holdout_matrix = holdout_matrix,
+      input_features = inputFeatures,
+      model_type = model,
+      params = bootstrap_params
+    )
+  )
+  
+  mean_delta <- mean(delta_values)
+  ci_bound_low <- mean_delta - 1.96 * sd(delta_values) / sqrt(R)
+  ci_bound_up <- mean_delta + 1.96 * sd(delta_values) / sqrt(R)
+  
+  results_list[[as.character(f)]] <- data.frame(
+    fraction = f,
+    mean_delta = mean_delta,
+    lower_ci = ci_bound_low,
+    upper_ci =  ci_bound_up
+  )
+}
+
+final_bootstrap_results <- bind_rows(results_list)
+
+# GRAPH 2
+ggplot(final_bootstrap_results, aes(x = fraction, y = mean_delta)) +
+  geom_smooth() +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.03) +
+  scale_x_continuous() +
+  scale_y_continuous(sec.axis = sec_axis(~ . / 0.056677, name = "Normalized Average Difference")) +
+  labs(
+    x = "Fraction Treatment",
+    y = "Average difference between ingroup and outgroup minutes",
+    title = paste("Algorithmic Predictions -", selectedModel, "|", selectedIngroup)
+  ) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    axis.text.x = element_text(hjust = .5),
+    legend.position = "none",
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)
+  )
+```
+
+
+
+
+
